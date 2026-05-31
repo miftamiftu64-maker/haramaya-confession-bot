@@ -3,7 +3,7 @@ from telebot import types
 import sqlite3
 import logging
 import time
-from datetime datetime
+from datetime import datetime
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 BOT_TOKEN          = '8580557776:AAEBqV6RvaXUdxYCD9khVNuckt_y-3xBmow'
