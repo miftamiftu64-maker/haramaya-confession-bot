@@ -490,20 +490,34 @@ def receive_tag(message):
         bot.send_message(message.chat.id, "❌ Session expired. Please start over.", reply_markup=main_keyboard())
         return
 
-    conf_id = save_pending(message.from_user.id, confession_text, selected_tag)
+    num = next_number()
+    channel_text = f"{selected_tag}\n\n{confession_text}\n\n#{num}\n#HaramayaConfessions"
     set_state(message.from_user.id, 'idle')
-
-    bot.send_message(
-        message.chat.id,
-        f"✅ Confession Submitted!\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🏷 Tag: {selected_tag}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"⏳ Waiting for admin approval...\n"
-        f"You'll be notified once it's posted 🔔",
-        reply_markup=main_keyboard()
-    )
-    send_to_admins(conf_id, message.from_user.id, confession_text, selected_tag)
+    try:
+        channel_msg = bot.send_message(
+            CHANNEL_USERNAME,
+            channel_text,
+            reply_markup=post_buttons(num)
+        )
+        group_msg = bot.send_message(
+            DISCUSSION_GROUP,
+            f"💬 Comments for Confession #{num}\n\nTap below to comment anonymously 👇",
+            reply_markup=post_buttons(num)
+        )
+        save_posted(num, channel_msg.message_id, group_msg.message_id, confession_text, selected_tag, message.from_user.id)
+        bot.send_message(
+            message.chat.id,
+            f"✅ Confession Posted!\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🏷 Tag: {selected_tag}\n"
+            f"Posted as #{num}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"Thank you for sharing 💙",
+            reply_markup=main_keyboard()
+        )
+    except Exception as e:
+        bot.send_message(message.chat.id, "❌ Failed to post. Please try again.", reply_markup=main_keyboard())
+        logger.error(f"Auto post failed: {e}")
 
 # ─── COMMENT ──────────────────────────────────────────────────────────────────
 @bot.message_handler(func=lambda m: m.text == '💬 Comment')
@@ -618,167 +632,148 @@ def receive_comment(message):
         logger.error(f"Failed to post comment: {e}")
         bot.send_message(message.chat.id, "❌ Failed to post comment. Please try again.", reply_markup=main_keyboard())
 
-# ─── INLINE BUTTON: page navigation & add comment ─────────────────────────────
+# ─── INLINE BUTTON: page comments ─────────────────────────────────────────────
 @bot.callback_query_handler(func=lambda call: call.data.startswith('cmtpage:'))
 def handle_comment_page(call):
-    _, conf_num_str, page_str = call.data.split(':')
-    conf_num = int(conf_num_str)
-    page = int(page_str)
-    show_comments_page(call.message.chat.id, conf_num, page, message_id=call.message.message_id)
-    bot.answer_callback_query(call.id)
+    try:
+        parts = call.data.split(':')
+        conf_num = int(parts[1])
+        page = int(parts[2])
+        show_comments_page(call.message.chat.id, conf_num, page, call.message.message_id)
+        bot.answer_callback_query(call.id)
+    except Exception as e:
+        logger.error(f"Error handling comment page: {e}")
+        bot.answer_callback_query(call.id, "Error loading page", show_alert=True)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('addcomment:'))
-def handle_add_comment_btn(call):
-    conf_num = int(call.data.split(':')[1])
-    bot.answer_callback_query(call.id)
-    ask_for_comment(call.message.chat.id, call.from_user.id, conf_num)
+def handle_add_comment_button(call):
+    try:
+        conf_num = int(call.data.split(':')[1])
+        ask_for_comment(call.message.chat.id, call.from_user.id, conf_num)
+        bot.answer_callback_query(call.id)
+    except Exception as e:
+        logger.error(f"Error handling add comment: {e}")
+        bot.answer_callback_query(call.id, "Error", show_alert=True)
 
 @bot.callback_query_handler(func=lambda call: call.data == 'noop')
 def handle_noop(call):
     bot.answer_callback_query(call.id)
 
-# ─── NOTIFY ADMINS ────────────────────────────────────────────────────────────
+# ─── ADMIN: approve & post ────────────────────────────────────────────────────
 def send_to_admins(conf_id, user_id, text, tag):
-    preview = text[:300] + ('…' if len(text) > 300 else '')
-    msg_text = (
-        f"New Confession (ID: {conf_id})\n"
-        f"Tag: {tag}\n"
-        f"User: {user_id}\n"
-        f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
-        f"{preview}"
-    )
-    markup = types.InlineKeyboardMarkup()
-    markup.add(
-        types.InlineKeyboardButton("✅ Approve", callback_data=f"approve:{conf_id}:{user_id}"),
-        types.InlineKeyboardButton("❌ Reject",  callback_data=f"reject:{conf_id}:{user_id}")
-    )
-    for admin_id in ADMIN_USER_IDS:
-        try:
-            bot.send_message(admin_id, msg_text, reply_markup=markup)
-        except Exception as e:
-            logger.warning(f"Could not reach admin {admin_id}: {e}")
-
-# ─── ADMIN APPROVE / REJECT ───────────────────────────────────────────────────
-@bot.callback_query_handler(func=lambda call: call.data.startswith(('approve:', 'reject:')))
-def handle_decision(call):
-    parts    = call.data.split(':')
-    action   = parts[0]
-    conf_id  = int(parts[1])
-
-    row = get_pending(conf_id)
-    if not row:
-        bot.answer_callback_query(call.id, "⚠️ Already handled.")
+    """Send pending confession to admins for approval (legacy, not used with auto-post)"""
+    pending = get_pending(conf_id)
+    if not pending:
         return
 
-    user_id = row['user_id']
-    text    = row['confession_text']
-    tag     = row['tag']
+    for admin_id in ADMIN_USER_IDS:
+        try:
+            markup = types.InlineKeyboardMarkup(row_width=2)
+            markup.add(
+                types.InlineKeyboardButton("✅ Approve", callback_data=f"approve:{conf_id}"),
+                types.InlineKeyboardButton("❌ Reject", callback_data=f"reject:{conf_id}")
+            )
+            bot.send_message(
+                admin_id,
+                f"📝 New Confession Pending Approval\n\n"
+                f"━━━━━━━━━━━━━━━━━━━━━\n"
+                f"🏷 Tag: {tag}\n"
+                f"👤 User ID: {user_id}\n"
+                f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"{text}\n\n"
+                f"━━━━━━━━━━━━━━━━━━━━━",
+                reply_markup=markup
+            )
+        except Exception as e:
+            logger.error(f"Failed to send to admin {admin_id}: {e}")
 
-    if action == 'approve':
+@bot.callback_query_handler(func=lambda call: call.data.startswith('approve:'))
+def handle_approve(call):
+    try:
+        conf_id = int(call.data.split(':')[1])
+        pending = get_pending(conf_id)
+        if not pending:
+            bot.answer_callback_query(call.id, "Confession not found", show_alert=True)
+            return
+
         num = next_number()
-        channel_text = f"{tag}\n\n{text}\n\n#{num}\n#HaramayaConfessions"
+        channel_text = f"{pending['tag']}\n\n{pending['confession_text']}\n\n#{num}\n#HaramayaConfessions"
+
+        channel_msg = bot.send_message(
+            CHANNEL_USERNAME,
+            channel_text,
+            reply_markup=post_buttons(num)
+        )
+        group_msg = bot.send_message(
+            DISCUSSION_GROUP,
+            f"💬 Comments for Confession #{num}\n\nTap below to comment anonymously 👇",
+            reply_markup=post_buttons(num)
+        )
+        save_posted(num, channel_msg.message_id, group_msg.message_id, pending['confession_text'], pending['tag'], pending['user_id'])
+        delete_pending(conf_id)
+
+        bot.edit_message_text(
+            f"✅ Approved & Posted as #{num}",
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id
+        )
+        bot.answer_callback_query(call.id, "Approved!", show_alert=False)
 
         try:
-            channel_msg = bot.send_message(
-                CHANNEL_USERNAME,
-                channel_text,
-                reply_markup=post_buttons(num)
+            bot.send_message(
+                pending['user_id'],
+                f"✅ Your confession was approved!\n\n"
+                f"━━━━━━━━━━━━━━━━━━━━━\n"
+                f"🏷 Tag: {pending['tag']}\n"
+                f"Posted as #{num}\n"
+                f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"Thank you for sharing 💙",
+                reply_markup=main_keyboard()
             )
-            group_msg = bot.send_message(
-                DISCUSSION_GROUP,
-                f"💬 Comments for Confession #{num}\n\nTap below to comment anonymously 👇",
-                reply_markup=post_buttons(num)
-            )
-            save_posted(num, channel_msg.message_id, group_msg.message_id, text, tag, user_id)
+        except Exception:
+            pass
 
-        except Exception as e:
-            bot.answer_callback_query(call.id, f"❌ Error: {e}")
-            logger.error(f"Channel post failed: {e}")
+    except Exception as e:
+        logger.error(f"Error approving confession: {e}")
+        bot.answer_callback_query(call.id, "Error approving", show_alert=True)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('reject:'))
+def handle_reject(call):
+    try:
+        conf_id = int(call.data.split(':')[1])
+        pending = get_pending(conf_id)
+        if not pending:
+            bot.answer_callback_query(call.id, "Confession not found", show_alert=True)
             return
 
         delete_pending(conf_id)
+        bot.edit_message_text(
+            "❌ Rejected",
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id
+        )
+        bot.answer_callback_query(call.id, "Rejected", show_alert=False)
 
         try:
             bot.send_message(
-                user_id,
-                f"🎉 Confession Approved!\n\n"
-                f"━━━━━━━━━━━━━━━━━━━━━\n"
-                f"Your confession was posted as #{num}\n"
-                f"━━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"Thank you for sharing with the Haramaya community 💙",
+                pending['user_id'],
+                "❌ Your confession was rejected by admins.\n\n"
+                "Please review our community guidelines and try again.",
                 reply_markup=main_keyboard()
             )
         except Exception:
             pass
 
-        try:
-            bot.edit_message_text(
-                f"✅ APPROVED as #{num}\n\n{call.message.text}",
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id
-            )
-        except Exception:
-            pass
+    except Exception as e:
+        logger.error(f"Error rejecting confession: {e}")
+        bot.answer_callback_query(call.id, "Error rejecting", show_alert=True)
 
-        bot.answer_callback_query(call.id, f"Posted as #{num} ✅")
-        logger.info(f"Confession #{num} approved by {call.from_user.id}")
-
-    elif action == 'reject':
-        delete_pending(conf_id)
-
-        try:
-            bot.send_message(
-                user_id,
-                "❌ Confession Not Approved\n\n"
-                "━━━━━━━━━━━━━━━━━━━━━\n"
-                "Your confession was not approved this time.\n"
-                "━━━━━━━━━━━━━━━━━━━━━\n\n"
-                "You're welcome to submit a new one 📝",
-                reply_markup=main_keyboard()
-            )
-        except Exception:
-            pass
-
-        try:
-            bot.edit_message_text(
-                f"❌ REJECTED\n\n{call.message.text}",
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id
-            )
-        except Exception:
-            pass
-
-        bot.answer_callback_query(call.id, "Rejected ❌")
-        logger.info(f"Confession {conf_id} rejected by {call.from_user.id}")
-
-# ─── DEBUG ────────────────────────────────────────────────────────────────────
-@bot.message_handler(commands=['debug'])
-def debug_state(message):
-    session = get_session(message.from_user.id)
-    bot.send_message(
-        message.chat.id,
-        f"Debug Info\n\nState: {session.get('state')}\n"
-        f"Temp: {str(session.get('temp_confession','None'))[:50]}\n"
-        f"Commenting on: {session.get('commenting_on')}"
-    )
-
-# ─── CATCH UNHANDLED ──────────────────────────────────────────────────────────
-@bot.message_handler(func=lambda m: True, content_types=['text'])
-def handle_unhandled(message):
-    bot.send_message(message.chat.id, "👇 Use the menu below or tap /start", reply_markup=main_keyboard())
-
-@bot.message_handler(content_types=['photo', 'video', 'audio', 'document', 'sticker', 'voice'])
-def handle_media(message):
-    bot.send_message(message.chat.id, "❌ Only text messages are accepted.", reply_markup=main_keyboard())
-
-# ─── AUTO-RESTART LOOP ────────────────────────────────────────────────────────
+# ─── POLLING ──────────────────────────────────────────────────────────────────
 if __name__ == '__main__':
-    logger.info("Bot starting...")
     set_bot_commands()
-    while True:
-        try:
-            logger.info("Polling started.")
-            bot.infinity_polling(timeout=60, long_polling_timeout=60)
-        except Exception as e:
-            logger.error(f"Bot crashed: {e}. Restarting in 5 seconds...")
-            time.sleep(5)
+    logger.info("Bot started. Polling...")
+    try:
+        bot.infinity_polling()
+    except Exception as e:
+        logger.error(f"Bot error: {e}")
+
