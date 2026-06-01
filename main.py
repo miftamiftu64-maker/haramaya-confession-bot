@@ -336,7 +336,7 @@ def cmd_start(message):
     first_name = message.from_user.first_name or 'there'
     bot.send_message(
         message.chat.id,
-        f"👋 Hey {first_name}! Welcome to Haramaya Confession Bot\n\n"
+        f"👋 Dear MGMT GC Students! Welcome to Haramaya Confession Bot\n\n"
         "━━━━━━━━━━━━━━━━━━━━━\n"
         "🔒 100% Anonymous — no one will ever know who you are\n"
         "━━━━━━━━━━━━━━━━━━━━━\n\n"
