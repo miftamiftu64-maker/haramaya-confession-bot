@@ -52,14 +52,18 @@ def init_db():
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id         INTEGER,
                 confession_text TEXT,
+                media_file_id   TEXT,
+                media_type      TEXT,
                 tag             TEXT,
                 timestamp       DATETIME DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE IF NOT EXISTS user_sessions (
-                user_id         INTEGER PRIMARY KEY,
-                state           TEXT DEFAULT 'idle',
-                temp_confession TEXT,
-                commenting_on   INTEGER
+                user_id            INTEGER PRIMARY KEY,
+                state              TEXT DEFAULT 'idle',
+                temp_confession    TEXT,
+                temp_media_file_id TEXT,
+                temp_media_type    TEXT,
+                commenting_on      INTEGER
             );
             CREATE TABLE IF NOT EXISTS confession_counter (
                 id          INTEGER PRIMARY KEY CHECK (id = 1),
@@ -70,6 +74,8 @@ def init_db():
                 channel_msg_id     INTEGER,
                 group_msg_id       INTEGER,
                 confession_text    TEXT,
+                media_file_id      TEXT,
+                media_type         TEXT,
                 tag                TEXT,
                 user_id            INTEGER
             );
@@ -82,6 +88,19 @@ def init_db():
             );
         ''')
         conn.execute('INSERT OR IGNORE INTO confession_counter (id, last_number) VALUES (1, 1499)')
+        # Migrate existing databases: add media columns if they don't exist yet
+        for table, col, col_type in [
+            ('pending_confessions', 'media_file_id',      'TEXT'),
+            ('pending_confessions', 'media_type',         'TEXT'),
+            ('posted_confessions',  'media_file_id',      'TEXT'),
+            ('posted_confessions',  'media_type',         'TEXT'),
+            ('user_sessions',       'temp_media_file_id', 'TEXT'),
+            ('user_sessions',       'temp_media_type',    'TEXT'),
+        ]:
+            try:
+                conn.execute(f'ALTER TABLE {table} ADD COLUMN {col} {col_type}')
+            except Exception:
+                pass  # Column already exists
         conn.commit()
 
 init_db()
@@ -94,24 +113,30 @@ def next_number():
         conn.commit()
     return n
 
-def set_state(user_id, state, confession=None, commenting_on=None):
+def set_state(user_id, state, confession=None, media_file_id=None, media_type=None, commenting_on=None):
     with get_conn() as conn:
         conn.execute(
-            'INSERT OR REPLACE INTO user_sessions (user_id, state, temp_confession, commenting_on) VALUES (?,?,?,?)',
-            (user_id, state, confession, commenting_on)
+            'INSERT OR REPLACE INTO user_sessions '
+            '(user_id, state, temp_confession, temp_media_file_id, temp_media_type, commenting_on) '
+            'VALUES (?,?,?,?,?,?)',
+            (user_id, state, confession, media_file_id, media_type, commenting_on)
         )
         conn.commit()
 
 def get_session(user_id):
     with get_conn() as conn:
         row = conn.execute('SELECT * FROM user_sessions WHERE user_id=?', (user_id,)).fetchone()
-    return dict(row) if row else {'user_id': user_id, 'state': 'idle', 'temp_confession': None, 'commenting_on': None}
+    return dict(row) if row else {
+        'user_id': user_id, 'state': 'idle',
+        'temp_confession': None, 'temp_media_file_id': None, 'temp_media_type': None,
+        'commenting_on': None
+    }
 
-def save_pending(user_id, text, tag):
+def save_pending(user_id, text, tag, media_file_id=None, media_type=None):
     with get_conn() as conn:
         cursor = conn.execute(
-            'INSERT INTO pending_confessions (user_id, confession_text, tag) VALUES (?,?,?)',
-            (user_id, text, tag)
+            'INSERT INTO pending_confessions (user_id, confession_text, media_file_id, media_type, tag) VALUES (?,?,?,?,?)',
+            (user_id, text, media_file_id, media_type, tag)
         )
         conn.commit()
         return cursor.lastrowid
@@ -126,11 +151,13 @@ def delete_pending(conf_id):
         conn.execute('DELETE FROM pending_confessions WHERE id=?', (conf_id,))
         conn.commit()
 
-def save_posted(confession_number, channel_msg_id, group_msg_id, text, tag, user_id):
+def save_posted(confession_number, channel_msg_id, group_msg_id, text, tag, user_id, media_file_id=None, media_type=None):
     with get_conn() as conn:
         conn.execute(
-            'INSERT OR REPLACE INTO posted_confessions (confession_number, channel_msg_id, group_msg_id, confession_text, tag, user_id) VALUES (?,?,?,?,?,?)',
-            (confession_number, channel_msg_id, group_msg_id, text, tag, user_id)
+            'INSERT OR REPLACE INTO posted_confessions '
+            '(confession_number, channel_msg_id, group_msg_id, confession_text, media_file_id, media_type, tag, user_id) '
+            'VALUES (?,?,?,?,?,?,?,?)',
+            (confession_number, channel_msg_id, group_msg_id, text, media_file_id, media_type, tag, user_id)
         )
         conn.commit()
 
@@ -276,12 +303,18 @@ def show_comments_page(chat_id, conf_num, page, message_id=None):
     start = page * COMMENTS_PER_PAGE
     slice_ = comments[start:start + COMMENTS_PER_PAGE]
 
-    confession_preview = posted['confession_text'][:100] + ('…' if len(posted['confession_text']) > 100 else '')
+    media_label = ''
+    if posted.get('media_type'):
+        icons = {'photo': '🖼', 'sticker': '🎭', 'video': '🎬', 'document': '📎', 'animation': '🎞'}
+        media_label = f"{icons.get(posted['media_type'], '📎')} [{posted['media_type'].capitalize()}]\n"
+    confession_preview = ''
+    if posted.get('confession_text'):
+        confession_preview = posted['confession_text'][:100] + ('…' if len(posted['confession_text']) > 100 else '')
     text = (
         f"💬 Comments for Confession #{conf_num}\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n"
         f"🏷 {posted['tag']}\n"
-        f"{confession_preview}\n"
+        f"{media_label}{confession_preview}\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n"
         f"Total: {total} comment(s)  •  Page {page+1}/{total_pages}\n\n"
     )
@@ -327,7 +360,9 @@ def cmd_start(message):
         set_state(message.from_user.id, 'awaiting_confession')
         bot.send_message(
             message.chat.id,
-            "📝 Write your confession below and send it:\n\n🔒 Your identity will never be revealed",
+            "📝 Send your confession below:\n"
+            "You can send text, a photo, sticker, video, GIF, or file.\n\n"
+            "🔒 Your identity will never be revealed",
             reply_markup=cancel_keyboard()
         )
         return
@@ -355,7 +390,9 @@ def cmd_confess(message):
     set_state(message.from_user.id, 'awaiting_confession')
     bot.send_message(
         message.chat.id,
-        "📝 Write your confession below and send it:\n\n🔒 Your identity will never be revealed",
+        "📝 Send your confession below:\n"
+        "You can send text, a photo, sticker, video, GIF, or file.\n\n"
+        "🔒 Your identity will never be revealed",
         reply_markup=cancel_keyboard()
     )
 
@@ -386,10 +423,9 @@ def show_help(message):
         "━━━━━━━━━━━━━━━━━━━━━\n"
         "📝 Submitting a Confession\n"
         "1. Tap Confess\n"
-        "2. Write your confession\n"
+        "2. Send your confession — text, photo, sticker, video, GIF, or file\n"
         "3. Choose a tag\n"
-        "4. Wait for admin approval\n"
-        "5. Posted anonymously!\n\n"
+        "4. Posted anonymously!\n\n"
         "━━━━━━━━━━━━━━━━━━━━━\n"
         "💬 Commenting\n"
         "1. Tap Comment or tap the button under any channel post\n"
@@ -418,9 +454,16 @@ def my_submissions(message):
         return
 
     text = "📜 Your Approved Confessions (latest 10)\n\n"
+    media_icons = {'photo': '🖼', 'sticker': '🎭', 'video': '🎬', 'document': '📎', 'animation': '🎞'}
     for s in submissions:
-        preview = s['confession_text'][:80] + ('…' if len(s['confession_text']) > 80 else '')
         comments = get_comments(s['confession_number'])
+        if s.get('media_type'):
+            icon    = media_icons.get(s['media_type'], '📎')
+            preview = f"{icon} [{s['media_type'].capitalize()}]"
+            if s.get('confession_text'):
+                preview += ' — ' + s['confession_text'][:60] + ('…' if len(s['confession_text']) > 60 else '')
+        else:
+            preview = s['confession_text'][:80] + ('…' if len(s['confession_text']) > 80 else '')
         text += f"#{s['confession_number']} {s['tag']}\n{preview}\n💬 {len(comments)} comment(s)\n\n"
 
     bot.send_message(message.chat.id, text, reply_markup=main_keyboard())
@@ -431,32 +474,73 @@ def prompt_confession(message):
     set_state(message.from_user.id, 'awaiting_confession')
     bot.send_message(
         message.chat.id,
-        "📝 Write your confession below and send it:\n\n🔒 Your identity will never be revealed",
+        "📝 Send your confession below:\n"
+        "You can send text, a photo, sticker, video, GIF, or file.\n\n"
+        "🔒 Your identity will never be revealed",
         reply_markup=cancel_keyboard()
     )
 
-# ─── CONFESS — STEP 2: receive text ───────────────────────────────────────────
+# ─── CONFESS — STEP 2: receive confession (text, photo, sticker, etc.) ────────
 @bot.message_handler(func=lambda m: get_session(m.from_user.id).get('state') == 'awaiting_confession',
-                     content_types=['text'])
+                     content_types=['text', 'photo', 'sticker', 'document', 'video', 'animation'])
 def receive_confession(message):
     session = get_session(message.from_user.id)
     if session.get('state') != 'awaiting_confession':
         return
 
-    if message.text == '❌ Cancel':
+    # Cancel button (only available on text messages)
+    if message.content_type == 'text' and message.text == '❌ Cancel':
         set_state(message.from_user.id, 'idle')
         bot.send_message(message.chat.id, "❌ Cancelled.", reply_markup=main_keyboard())
         return
 
-    text = message.text.strip()
-    if len(text) < 5:
-        bot.send_message(message.chat.id, "❌ Too short. Please write at least 5 characters.")
-        return
-    if len(text) > 2000:
-        bot.send_message(message.chat.id, "❌ Too long! Keep it under 2000 characters.")
+    # ── Extract text and/or media ──────────────────────────────────────────────
+    confession_text = ''
+    media_file_id   = None
+    media_type      = None
+
+    if message.content_type == 'text':
+        confession_text = message.text.strip()
+        if len(confession_text) < 5:
+            bot.send_message(message.chat.id, "❌ Too short. Please write at least 5 characters.")
+            return
+        if len(confession_text) > 2000:
+            bot.send_message(message.chat.id, "❌ Too long! Keep it under 2000 characters.")
+            return
+
+    elif message.content_type == 'photo':
+        media_file_id  = message.photo[-1].file_id  # highest resolution
+        media_type     = 'photo'
+        confession_text = message.caption.strip() if message.caption else ''
+
+    elif message.content_type == 'sticker':
+        media_file_id  = message.sticker.file_id
+        media_type     = 'sticker'
+
+    elif message.content_type == 'document':
+        media_file_id  = message.document.file_id
+        media_type     = 'document'
+        confession_text = message.caption.strip() if message.caption else ''
+
+    elif message.content_type == 'video':
+        media_file_id  = message.video.file_id
+        media_type     = 'video'
+        confession_text = message.caption.strip() if message.caption else ''
+
+    elif message.content_type == 'animation':
+        media_file_id  = message.animation.file_id
+        media_type     = 'animation'
+        confession_text = message.caption.strip() if message.caption else ''
+
+    # Must have at least some content
+    if not media_file_id and not confession_text:
+        bot.send_message(message.chat.id, "❌ Please send a message, photo, sticker, or other media.")
         return
 
-    set_state(message.from_user.id, 'awaiting_tag', confession=text)
+    set_state(message.from_user.id, 'awaiting_tag',
+              confession=confession_text,
+              media_file_id=media_file_id,
+              media_type=media_type)
     bot.send_message(message.chat.id, "🏷 Now choose a tag for your confession:", reply_markup=tag_keyboard())
 
 # ─── CONFESS — STEP 3: receive tag ────────────────────────────────────────────
@@ -484,27 +568,62 @@ def receive_tag(message):
         bot.send_message(message.chat.id, "❌ Please select a tag from the buttons below.", reply_markup=tag_keyboard())
         return
 
-    confession_text = session.get('temp_confession')
-    if not confession_text:
+    confession_text  = session.get('temp_confession') or ''
+    media_file_id    = session.get('temp_media_file_id')
+    media_type       = session.get('temp_media_type')
+
+    # Require at least text or media
+    if not confession_text and not media_file_id:
         set_state(message.from_user.id, 'idle')
         bot.send_message(message.chat.id, "❌ Session expired. Please start over.", reply_markup=main_keyboard())
         return
 
-    num = next_number()
-    channel_text = f"{selected_tag}\n\n{confession_text}\n\n#{num}\n#HaramayaConfessions"
+    num          = next_number()
+    caption_text = f"{selected_tag}\n\n{confession_text}\n\n#{num}\n#HaramayaConfessions" if confession_text \
+                   else f"{selected_tag}\n\n#{num}\n#HaramayaConfessions"
     set_state(message.from_user.id, 'idle')
     try:
-        channel_msg = bot.send_message(
-            CHANNEL_USERNAME,
-            channel_text,
-            reply_markup=post_buttons(num)
-        )
+        # ── Post to channel ────────────────────────────────────────────────────
+        if media_type == 'photo':
+            channel_msg = bot.send_photo(
+                CHANNEL_USERNAME, media_file_id,
+                caption=caption_text, reply_markup=post_buttons(num)
+            )
+        elif media_type == 'sticker':
+            # Send sticker first, then a caption message (stickers can't have captions)
+            bot.send_sticker(CHANNEL_USERNAME, media_file_id)
+            channel_msg = bot.send_message(
+                CHANNEL_USERNAME, caption_text, reply_markup=post_buttons(num)
+            )
+        elif media_type == 'document':
+            channel_msg = bot.send_document(
+                CHANNEL_USERNAME, media_file_id,
+                caption=caption_text, reply_markup=post_buttons(num)
+            )
+        elif media_type == 'video':
+            channel_msg = bot.send_video(
+                CHANNEL_USERNAME, media_file_id,
+                caption=caption_text, reply_markup=post_buttons(num)
+            )
+        elif media_type == 'animation':
+            channel_msg = bot.send_animation(
+                CHANNEL_USERNAME, media_file_id,
+                caption=caption_text, reply_markup=post_buttons(num)
+            )
+        else:
+            # Text-only confession
+            channel_msg = bot.send_message(
+                CHANNEL_USERNAME, caption_text, reply_markup=post_buttons(num)
+            )
+
         group_msg = bot.send_message(
             DISCUSSION_GROUP,
             f"💬 Comments for Confession #{num}\n\nTap below to comment anonymously 👇",
             reply_markup=post_buttons(num)
         )
-        save_posted(num, channel_msg.message_id, group_msg.message_id, confession_text, selected_tag, message.from_user.id)
+        save_posted(num, channel_msg.message_id, group_msg.message_id,
+                    confession_text, selected_tag, message.from_user.id,
+                    media_file_id=media_file_id, media_type=media_type)
         bot.send_message(
             message.chat.id,
             f"✅ Confession Posted!\n\n"
@@ -557,7 +676,16 @@ def ask_for_comment(chat_id, user_id, conf_num):
         return
 
     comments = get_comments(conf_num)
-    preview = posted['confession_text'][:200] + ('…' if len(posted['confession_text']) > 200 else '')
+
+    # Build a preview that handles both text and media confessions
+    media_icons = {'photo': '🖼', 'sticker': '🎭', 'video': '🎬', 'document': '📎', 'animation': '🎞'}
+    if posted.get('media_type'):
+        icon    = media_icons.get(posted['media_type'], '📎')
+        preview = f"{icon} [{posted['media_type'].capitalize()}]"
+        if posted.get('confession_text'):
+            preview += '\n' + posted['confession_text'][:200] + ('…' if len(posted['confession_text']) > 200 else '')
+    else:
+        preview = posted['confession_text'][:200] + ('…' if len(posted['confession_text']) > 200 else '')
 
     bot.send_message(
         chat_id,
@@ -666,6 +794,11 @@ def send_to_admins(conf_id, user_id, text, tag):
     if not pending:
         return
 
+    media_file_id = pending.get('media_file_id')
+    media_type    = pending.get('media_type')
+    media_icons   = {'photo': '🖼', 'sticker': '🎭', 'video': '🎬', 'document': '📎', 'animation': '🎞'}
+    media_line    = f"\n📎 Media: {media_icons.get(media_type, '📎')} {media_type.capitalize()}" if media_type else ''
+
     for admin_id in ADMIN_USER_IDS:
         try:
             markup = types.InlineKeyboardMarkup(row_width=2)
@@ -673,17 +806,29 @@ def send_to_admins(conf_id, user_id, text, tag):
                 types.InlineKeyboardButton("✅ Approve", callback_data=f"approve:{conf_id}"),
                 types.InlineKeyboardButton("❌ Reject", callback_data=f"reject:{conf_id}")
             )
-            bot.send_message(
-                admin_id,
+            admin_text = (
                 f"📝 New Confession Pending Approval\n\n"
                 f"━━━━━━━━━━━━━━━━━━━━━\n"
                 f"🏷 Tag: {tag}\n"
-                f"👤 User ID: {user_id}\n"
+                f"👤 User ID: {user_id}{media_line}\n"
                 f"━━━━━━━━━━━━━━━━━━━━━\n\n"
                 f"{text}\n\n"
-                f"━━━━━━━━━━━━━━━━━━━━━",
-                reply_markup=markup
+                f"━━━━━━━━━━━━━━━━━━━━━"
             )
+            # If there's media, send it alongside the approval message
+            if media_type == 'photo':
+                bot.send_photo(admin_id, media_file_id, caption=admin_text, reply_markup=markup)
+            elif media_type == 'sticker':
+                bot.send_sticker(admin_id, media_file_id)
+                bot.send_message(admin_id, admin_text, reply_markup=markup)
+            elif media_type == 'document':
+                bot.send_document(admin_id, media_file_id, caption=admin_text, reply_markup=markup)
+            elif media_type == 'video':
+                bot.send_video(admin_id, media_file_id, caption=admin_text, reply_markup=markup)
+            elif media_type == 'animation':
+                bot.send_animation(admin_id, media_file_id, caption=admin_text, reply_markup=markup)
+            else:
+                bot.send_message(admin_id, admin_text, reply_markup=markup)
         except Exception as e:
             logger.error(f"Failed to send to admin {admin_id}: {e}")
 
@@ -696,20 +841,51 @@ def handle_approve(call):
             bot.answer_callback_query(call.id, "Confession not found", show_alert=True)
             return
 
-        num = next_number()
-        channel_text = f"{pending['tag']}\n\n{pending['confession_text']}\n\n#{num}\n#HaramayaConfessions"
+        num              = next_number()
+        confession_text  = pending.get('confession_text') or ''
+        media_file_id    = pending.get('media_file_id')
+        media_type       = pending.get('media_type')
+        caption_text     = f"{pending['tag']}\n\n{confession_text}\n\n#{num}\n#HaramayaConfessions" if confession_text \
+                           else f"{pending['tag']}\n\n#{num}\n#HaramayaConfessions"
 
-        channel_msg = bot.send_message(
-            CHANNEL_USERNAME,
-            channel_text,
-            reply_markup=post_buttons(num)
-        )
+        if media_type == 'photo':
+            channel_msg = bot.send_photo(
+                CHANNEL_USERNAME, media_file_id,
+                caption=caption_text, reply_markup=post_buttons(num)
+            )
+        elif media_type == 'sticker':
+            bot.send_sticker(CHANNEL_USERNAME, media_file_id)
+            channel_msg = bot.send_message(
+                CHANNEL_USERNAME, caption_text, reply_markup=post_buttons(num)
+            )
+        elif media_type == 'document':
+            channel_msg = bot.send_document(
+                CHANNEL_USERNAME, media_file_id,
+                caption=caption_text, reply_markup=post_buttons(num)
+            )
+        elif media_type == 'video':
+            channel_msg = bot.send_video(
+                CHANNEL_USERNAME, media_file_id,
+                caption=caption_text, reply_markup=post_buttons(num)
+            )
+        elif media_type == 'animation':
+            channel_msg = bot.send_animation(
+                CHANNEL_USERNAME, media_file_id,
+                caption=caption_text, reply_markup=post_buttons(num)
+            )
+        else:
+            channel_msg = bot.send_message(
+                CHANNEL_USERNAME, caption_text, reply_markup=post_buttons(num)
+            )
+
         group_msg = bot.send_message(
             DISCUSSION_GROUP,
             f"💬 Comments for Confession #{num}\n\nTap below to comment anonymously 👇",
             reply_markup=post_buttons(num)
         )
-        save_posted(num, channel_msg.message_id, group_msg.message_id, pending['confession_text'], pending['tag'], pending['user_id'])
+        save_posted(num, channel_msg.message_id, group_msg.message_id,
+                    confession_text, pending['tag'], pending['user_id'],
+                    media_file_id=media_file_id, media_type=media_type)
         delete_pending(conf_id)
 
         bot.edit_message_text(
